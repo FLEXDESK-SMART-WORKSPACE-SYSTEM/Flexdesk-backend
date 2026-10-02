@@ -54,9 +54,12 @@ def password_digest(password: str) -> str:
 with SessionLocal() as db:
     demo_user = db.scalar(select(User).where(User.username == "ipshita"))
     if not demo_user:
-        db.add(User(username="ipshita", name="Ipshita Das", email="ipshita@persistent.com", department="Engineering", password_hash=password_digest("1234")))
+        demo_user = User(username="ipshita", name="Ipshita Das", email="ipshita@gmail.com", department="Engineering", password_hash=password_digest("1234"))
+        db.add(demo_user)
     else:
         demo_user.name = "Ipshita Das"
+        demo_user.email = "ipshita@gmail.com"
+        demo_user.department = "Engineering"
         demo_user.password_hash = password_digest("1234")
 
     for name, city, address, floor_name in OFFICES:
