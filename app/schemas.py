@@ -16,7 +16,7 @@ class UserOut(ORMModel):
 
 
 class LoginRequest(BaseModel):
-    username: str
+    email: str
     password: str
 
 

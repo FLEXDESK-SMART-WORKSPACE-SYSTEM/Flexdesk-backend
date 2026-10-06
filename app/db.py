@@ -27,6 +27,9 @@ def ensure_schema() -> None:
             if "username" not in columns:
                 connection.execute(text("ALTER TABLE users ADD COLUMN username VARCHAR(80)"))
                 connection.execute(text("UPDATE users SET username = COALESCE(NULLIF(email, ''), 'user_' || id) WHERE username IS NULL"))
+            if "entra_subject" not in columns:
+                connection.execute(text("ALTER TABLE users ADD COLUMN entra_subject VARCHAR(255)"))
+            connection.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_users_entra_subject ON users (entra_subject)"))
 
 
 def get_db() -> Generator[Session, None, None]:

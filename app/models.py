@@ -12,6 +12,7 @@ class User(Base):
     username: Mapped[str] = mapped_column(String(80), unique=True, index=True, default="")
     name: Mapped[str] = mapped_column(String(120))
     email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    entra_subject: Mapped[str | None] = mapped_column(String(255), unique=True, index=True)
     department: Mapped[str | None] = mapped_column(String(120))
     password_hash: Mapped[str | None] = mapped_column(String(255))
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

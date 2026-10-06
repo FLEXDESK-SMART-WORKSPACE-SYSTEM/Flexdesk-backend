@@ -1,31 +1,96 @@
 import os
 import hashlib
+import logging
+import secrets
 from datetime import date, time
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
+from authlib.integrations.starlette_client import OAuth
+from fastapi.responses import RedirectResponse
+from itsdangerous import BadData, URLSafeTimedSerializer
 from sqlalchemy import func, select
-from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session, selectinload
+from starlette.middleware.sessions import SessionMiddleware
 
 from .db import Base, engine, ensure_schema, get_db
+from .location_catalog import LOCATION_NAMES, OFFICES
 from .models import Bay, Booking, Floor, Location, Preference, User, Workspace
-from .schemas import AssistantRequest, BookingCreate, BookingOut, FloorOut, LocationOut, LoginRequest, LoginResponse, PreferenceIn, PreferenceOut, RecommendationRequest, WorkspaceOut, WorkspaceSearch
+from .schemas import AssistantRequest, BookingCreate, BookingOut, FloorOut, LocationOut, LoginRequest, LoginResponse, PreferenceIn, PreferenceOut, RecommendationRequest, UserOut, WorkspaceOut, WorkspaceSearch
 from .services import available_workspaces, parse_assistant_query, score_workspace
 
 Base.metadata.create_all(bind=engine)
 ensure_schema()
 app = FastAPI(title="FLEXDESK Backend", version="1.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173", "http://localhost:5174"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+logger = logging.getLogger(__name__)
+frontend_url = os.getenv("FRONTEND_URL", "http://localhost:5174").rstrip("/")
+tenant_id = os.getenv("MICROSOFT_TENANT_ID", "").strip()
+session_secret = os.getenv("SSO_SESSION_SECRET", "")
+oauth = OAuth()
+LOCATION_CATALOG = {office["location"]: office for office in OFFICES}
+
+if tenant_id and os.getenv("MICROSOFT_CLIENT_ID") and os.getenv("MICROSOFT_CLIENT_SECRET"):
+    oauth.register(
+        name="microsoft",
+        client_id=os.environ["MICROSOFT_CLIENT_ID"],
+        client_secret=os.environ["MICROSOFT_CLIENT_SECRET"],
+        server_metadata_url=f"https://login.microsoftonline.com/{tenant_id}/v2.0/.well-known/openid-configuration",
+        client_kwargs={"scope": "openid profile email"},
+    )
+
+if session_secret:
+    app.add_middleware(
+        SessionMiddleware,
+        secret_key=session_secret,
+        same_site="lax",
+        https_only=os.getenv("SSO_COOKIE_SECURE", "false").lower() == "true",
+    )
+
+
+def demo_auth_enabled() -> bool:
+    return os.getenv("ALLOW_DEMO_AUTH", "false").lower() == "true"
+
+
+def access_token(user: User) -> str:
+    secret = os.getenv("AUTH_TOKEN_SECRET")
+    if not secret:
+        if demo_auth_enabled():
+            return str(user.id)
+        raise HTTPException(status_code=503, detail="AUTH_TOKEN_SECRET is not configured")
+    return URLSafeTimedSerializer(secret, salt="flexdesk-access").dumps({"sub": user.id})
+
+
+def sso_redirect(fragment: str) -> RedirectResponse:
+    return RedirectResponse(f"{frontend_url}/#{fragment}", status_code=303)
+
+
+def sso_configured() -> bool:
+    return bool(
+        tenant_id
+        and os.getenv("MICROSOFT_CLIENT_ID")
+        and os.getenv("MICROSOFT_CLIENT_SECRET")
+        and os.getenv("MICROSOFT_REDIRECT_URI")
+        and session_secret
+        and os.getenv("AUTH_TOKEN_SECRET")
+        and oauth.create_client("microsoft")
+    )
 
 
 def current_user(authorization: str | None = Header(default=None), db: Session = Depends(get_db)) -> User:
     token = authorization.removeprefix("Bearer ").strip() if authorization else ""
-    if token.isdigit():
+    if token.isdigit() and demo_auth_enabled():
         user = db.get(User, int(token))
-    elif os.getenv("ALLOW_DEMO_AUTH", "true").lower() == "true":
-        user = db.scalar(select(User).order_by(User.id))
     else:
         user = None
+        secret = os.getenv("AUTH_TOKEN_SECRET")
+        if secret:
+            try:
+                claims = URLSafeTimedSerializer(secret, salt="flexdesk-access").loads(token, max_age=43200)
+                user = db.get(User, int(claims["sub"]))
+            except (BadData, KeyError, TypeError, ValueError):
+                user = None
     if not user:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="A valid bearer token is required")
     return user
@@ -37,10 +102,93 @@ def password_digest(password: str) -> str:
 
 @app.post("/api/v1/auth/login", response_model=LoginResponse)
 def login(payload: LoginRequest, db: Session = Depends(get_db)):
-    user = db.scalar(select(User).where(User.username == payload.username.lower().strip()))
-    if not user or not user.password_hash or user.password_hash != password_digest(payload.password):
-        raise HTTPException(status_code=401, detail="Invalid email or password")
-    return {"access_token": str(user.id), "user": user}
+    email = payload.email.lower().strip()
+    user = db.scalar(select(User).where(User.email == email))
+    if user and user.password_hash and user.password_hash == password_digest(payload.password):
+        return {"access_token": access_token(user), "user": user}
+    if os.getenv("ALLOW_DEMO_AUTH", "false").lower() == "true":
+        if not user:
+            name = email.partition("@")[0].replace(".", " ").replace("_", " ").replace("-", " ").strip().title()[:120] or "Demo User"
+            user = User(
+                username=f"demo_{secrets.token_hex(8)}",
+                name=name,
+                email=email,
+                department="Demo",
+                password_hash=password_digest(payload.password),
+            )
+            db.add(user)
+            try:
+                db.commit()
+            except IntegrityError:
+                db.rollback()
+                user = db.scalar(select(User).where(User.email == email))
+                if not user:
+                    raise
+            else:
+                db.refresh(user)
+        return {"access_token": access_token(user), "user": user}
+    raise HTTPException(status_code=401, detail="Invalid email or password")
+
+
+@app.get("/api/v1/auth/me", response_model=UserOut)
+def auth_me(user: User = Depends(current_user)):
+    return user
+
+
+@app.get("/api/v1/auth/sso")
+async def microsoft_sso(request: Request):
+    if not sso_configured():
+        return sso_redirect("sso_error=not_configured")
+    return await oauth.microsoft.authorize_redirect(request, os.environ["MICROSOFT_REDIRECT_URI"])
+
+
+@app.get("/api/v1/auth/sso/callback", name="microsoft_sso_callback")
+async def microsoft_sso_callback(request: Request, db: Session = Depends(get_db)):
+    if not sso_configured():
+        return sso_redirect("sso_error=not_configured")
+    try:
+        token = await oauth.microsoft.authorize_access_token(request)
+        claims = token.get("userinfo") or {}
+        claimed_tenant = str(claims.get("tid", "")).lower()
+        subject = str(claims.get("oid") or claims.get("sub") or "")
+        email = str(claims.get("email") or claims.get("preferred_username") or claims.get("upn") or "").strip().lower()
+        if claimed_tenant != tenant_id.lower() or not subject or "@" not in email or len(email) > 255:
+            return sso_redirect("sso_error=identity_not_allowed")
+
+        entra_subject = f"{claimed_tenant}:{subject}"
+        user = db.scalar(select(User).where(User.entra_subject == entra_subject))
+        if not user:
+            user = db.scalar(select(User).where(func.lower(User.email) == email))
+            if user and user.entra_subject and user.entra_subject != entra_subject:
+                return sso_redirect("sso_error=account_conflict")
+            if not user:
+                identity_key = hashlib.sha256(entra_subject.encode()).hexdigest()
+                user = User(
+                    username=f"entra_{identity_key}",
+                    name=str(claims.get("name") or email.partition("@")[0])[:120],
+                    email=email,
+                    department=claims.get("department"),
+                    entra_subject=entra_subject,
+                )
+                db.add(user)
+            else:
+                user.entra_subject = entra_subject
+        if claims.get("name"):
+            user.name = str(claims["name"])[:120]
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            user = db.scalar(select(User).where(User.entra_subject == entra_subject))
+            if not user:
+                raise
+        else:
+            db.refresh(user)
+        return sso_redirect(f"access_token={access_token(user)}")
+    except Exception:
+        db.rollback()
+        logger.exception("Microsoft Entra sign-in failed")
+        return sso_redirect("sso_error=authentication_failed")
 
 
 @app.get("/health")
@@ -48,24 +196,72 @@ def health():
     return {"status": "ok", "service": "flexdesk-backend"}
 
 
+def location_catalog_ready(db: Session) -> bool:
+    locations = db.scalars(
+        select(Location)
+        .options(selectinload(Location.floors).selectinload(Floor.bays))
+        .where(Location.name.in_(LOCATION_NAMES))
+    ).all()
+    if len(locations) != len(LOCATION_NAMES):
+        return False
+    if {location.name for location in locations} != set(LOCATION_NAMES):
+        return False
+
+    for location in locations:
+        expected_floors = LOCATION_CATALOG[location.name]["floors"]
+        floors = {floor.name: floor for floor in location.floors}
+        if len(floors) != len(location.floors) or set(floors) != {
+            floor["name"] for floor in expected_floors
+        }:
+            return False
+        for floor_spec in expected_floors:
+            bays = floors[floor_spec["name"]].bays
+            if len(bays) != len(floor_spec["bays"]) or {
+                bay.name for bay in bays
+            } != set(floor_spec["bays"]):
+                return False
+    return True
+
+
+def ordered_locations(db: Session) -> list[Location]:
+    rows = db.scalars(
+        select(Location).where(Location.name.in_(LOCATION_NAMES))
+    ).all()
+    order = {name: index for index, name in enumerate(LOCATION_NAMES)}
+    return sorted(rows, key=lambda location: order[location.name])
+
+
 @app.get("/api/v1/locations", response_model=list[LocationOut])
 def locations(db: Session = Depends(get_db)):
-    return db.scalars(select(Location).order_by(Location.name)).all()
+    if not location_catalog_ready(db):
+        return []
+    return ordered_locations(db)
 
 
 @app.get("/api/v1/locations/hierarchy")
 def location_hierarchy(db: Session = Depends(get_db)):
-    locations = [location for location in db.scalars(select(Location).order_by(Location.name)).all() if location.name != "Hyderabad Office"]
-    return [{
-        "id": location.id,
-        "name": location.name,
-        "city": location.city,
-        "address": location.address,
-        "floors": [{
-            "id": floor.id,
-            "number": floor.floor_number,
-            "name": floor.name,
-            "bays": [{
+    if not location_catalog_ready(db):
+        return []
+    locations = db.scalars(
+        select(Location)
+        .options(
+            selectinload(Location.floors)
+            .selectinload(Floor.bays)
+            .selectinload(Bay.workspaces)
+        )
+        .where(Location.name.in_(LOCATION_NAMES))
+    ).all()
+    locations.sort(key=lambda location: LOCATION_NAMES.index(location.name))
+
+    hierarchy = []
+    for location in locations:
+        office = LOCATION_CATALOG[location.name]
+        floor_order = {floor["name"]: index for index, floor in enumerate(office["floors"])}
+        floors_data = []
+        for floor in sorted(location.floors, key=lambda item: floor_order[item.name]):
+            floor_spec = office["floors"][floor_order[floor.name]]
+            bay_order = {name: index for index, name in enumerate(floor_spec["bays"])}
+            bays_data = [{
                 "id": bay.id,
                 "name": bay.name,
                 "type": bay.bay_type,
@@ -75,23 +271,61 @@ def location_hierarchy(db: Session = Depends(get_db)):
                     "type": workspace.workspace_type,
                     "capacity": workspace.capacity,
                     "status": workspace.status,
-                } for workspace in bay.workspaces],
-            } for bay in floor.bays],
-        } for floor in location.floors],
-    } for location in locations]
+                } for workspace in sorted(bay.workspaces, key=lambda item: item.id)],
+            } for bay in sorted(floor.bays, key=lambda item: bay_order[item.name])]
+            floors_data.append({
+                "id": floor.id,
+                "number": floor.floor_number,
+                "name": floor.name,
+                "bays": bays_data,
+            })
+        hierarchy.append({
+            "id": location.id,
+            "name": location.name,
+            "city": location.city,
+            "address": location.address,
+            "floors": floors_data,
+        })
+    return hierarchy
 
 
 @app.get("/api/v1/floors", response_model=list[FloorOut])
 def floors(location_id: int | None = None, db: Session = Depends(get_db)):
-    query = select(Floor).order_by(Floor.floor_number)
+    if not location_catalog_ready(db):
+        return []
+    query = select(Floor).order_by(Floor.id)
     if location_id:
-        query = query.where(Floor.location_id == location_id)
+        query = query.where(
+            Floor.location_id == location_id,
+            Floor.location_id.in_(
+                select(Location.id).where(Location.name.in_(LOCATION_NAMES))
+            ),
+        )
+    else:
+        query = query.where(
+            Floor.location_id.in_(
+                select(Location.id).where(Location.name.in_(LOCATION_NAMES))
+            )
+        )
     return db.scalars(query).all()
 
 
 @app.get("/api/v1/workspaces", response_model=list[WorkspaceOut])
 def workspaces(db: Session = Depends(get_db)):
-    return db.scalars(select(Workspace).order_by(Workspace.id)).all()
+    if not location_catalog_ready(db):
+        return []
+    return db.scalars(
+        select(Workspace)
+        .where(
+            Workspace.bay_id.in_(
+                select(Bay.id)
+                .join(Floor, Bay.floor_id == Floor.id)
+                .join(Location, Floor.location_id == Location.id)
+                .where(Location.name.in_(LOCATION_NAMES))
+            )
+        )
+        .order_by(Workspace.id)
+    ).all()
 
 
 @app.get("/api/v1/workspaces/available", response_model=list[WorkspaceOut])
