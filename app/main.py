@@ -216,9 +216,9 @@ def location_catalog_ready(db: Session) -> bool:
             return False
         for floor_spec in expected_floors:
             bays = floors[floor_spec["name"]].bays
-            if len(bays) != len(floor_spec["bays"]) or {
-                bay.name for bay in bays
-            } != set(floor_spec["bays"]):
+            if not set(floor_spec["bays"]).issubset(
+                {bay.name for bay in bays}
+            ):
                 return False
     return True
 
@@ -272,7 +272,10 @@ def location_hierarchy(db: Session = Depends(get_db)):
                     "capacity": workspace.capacity,
                     "status": workspace.status,
                 } for workspace in sorted(bay.workspaces, key=lambda item: item.id)],
-            } for bay in sorted(floor.bays, key=lambda item: bay_order[item.name])]
+            } for bay in sorted(
+                (bay for bay in floor.bays if bay.name in bay_order),
+                key=lambda item: bay_order[item.name],
+            )]
             floors_data.append({
                 "id": floor.id,
                 "number": floor.floor_number,

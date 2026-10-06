@@ -1,8 +1,5 @@
 import re
 
-BASE_BAYS = ("Open Area", "Meeting Room", "Focus Room")
-
-
 def office(
     location: str,
     city: str,
@@ -20,8 +17,7 @@ def office(
         else:
             raise ValueError(f"Floor name must include a floor number: {name}")
         selected_bays = (floor_bays or {}).get(name, bay_names)
-        combined_bays = tuple(dict.fromkeys((*selected_bays, *BASE_BAYS)))
-        floors.append({"name": name, "number": number, "bays": list(combined_bays)})
+        floors.append({"name": name, "number": number, "bays": list(selected_bays)})
     return {"location": location, "city": city, "address": None, "floors": floors}
 
 
