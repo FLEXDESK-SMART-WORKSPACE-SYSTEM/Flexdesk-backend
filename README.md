@@ -23,7 +23,6 @@ The backend `.env` contains the PostgreSQL connection. The password is requested
 
 ```env
 DATABASE_URL=postgresql+psycopg://postgres@127.0.0.1:5432/flexdesk
-ALLOW_DEMO_AUTH=false
 MICROSOFT_TENANT_ID=
 MICROSOFT_CLIENT_ID=
 MICROSOFT_CLIENT_SECRET=
@@ -35,8 +34,6 @@ SSO_COOKIE_SECURE=false
 ```
 
 Register a single-tenant Microsoft Entra ID app with a Web redirect URI matching `MICROSOFT_REDIRECT_URI`. Set the tenant ID, client ID, client secret, and two independently generated random secrets in `.env`. Set `ALLOW_DEMO_AUTH=false` when using SSO. Set `SSO_COOKIE_SECURE=true` when deployed over HTTPS. Never commit `.env` or share the client secret.
-
-For local demo use without SSO, `ALLOW_DEMO_AUTH=true` accepts any submitted email and password. This bypasses credential verification and should remain disabled when SSO is enabled or outside a local demo.
 
 ## Start FLEXDESK
 
@@ -52,7 +49,7 @@ Health check: `http://127.0.0.1:8002/health`
 
 ## Seed screenshot locations
 
-From this directory, enter the PostgreSQL password at the hidden prompt to synchronize the 24-location master catalog. Entries outside the catalog are removed, along with bookings tied to their workspaces; demo user accounts and preferences are preserved:
+From this directory, enter the PostgreSQL password at the hidden prompt to synchronize the 24-location master catalog and ensure the administrator account exists. The admin password is stored as a salted hash. Entries outside the catalog are removed, along with bookings tied to their workspaces; employee accounts and preferences are preserved:
 
 ```powershell
 $securePassword = Read-Host 'PostgreSQL password for user postgres (hidden input)' -AsSecureString
@@ -78,9 +75,9 @@ The command prompts for the PostgreSQL password using hidden input.
 
 ## Login
 
-When demo auth is disabled, use the email and password stored for a seeded account. The login endpoint is `POST /api/v1/auth/login`.
+Sign in with your employee ID and password at `POST /api/v1/auth/login`. Employees without a password can create one at `POST /api/v1/auth/password`; password hashes are salted. Login, failed-login, logout, and password-reset events are stored in `login_history`. The administrator can view employees, bookings, login history, and workspace inventory from the protected Admin page; every `/api/v1/admin/*` route checks the account role on the server.
 
-The frontend stores the returned bearer token and sends it with protected requests.
+The frontend keeps the returned bearer token for the browser session and sends it with API requests. Use the Logout button to end the frontend session. If `AUTH_TOKEN_SECRET` is not set, a random signing secret is generated for the backend process and tokens are invalidated when it restarts; set a persistent secret for sessions that should survive restarts.
 
 ## Main API areas
 

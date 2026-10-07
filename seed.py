@@ -1,12 +1,11 @@
 import argparse
-from datetime import date, time, timedelta
-
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from app.db import Base, SessionLocal, ensure_schema, engine
 from app.location_catalog import OFFICES
-from app.models import Bay, Booking, Floor, Location, Preference, User, Workspace
+from app.models import Bay, Booking, Floor, Location, User, Workspace
+from app.security import hash_password
 
 Base.metadata.create_all(bind=engine)
 ensure_schema()
@@ -37,11 +36,6 @@ def add_workspace_set(bay: Bay, prefix: str) -> None:
             has_window=True,
             is_quiet=workspace_type == "focus room",
         ))
-
-
-def password_digest(password: str) -> str:
-    import hashlib
-    return hashlib.pbkdf2_hmac("sha256", password.encode(), b"flexdesk-auth", 120_000).hex()
 
 
 def seed_locations(db: Session) -> None:
@@ -114,32 +108,22 @@ parser = argparse.ArgumentParser()
 parser.add_argument(
     "--locations-only",
     action="store_true",
-    help="Sync the location catalog without modifying demo user data or preferences.",
+    help="Retained for compatibility; synchronizes locations and ensures the admin account exists.",
 )
 args = parser.parse_args()
 
 with SessionLocal() as db:
-    if not args.locations_only:
-        demo_user = db.scalar(select(User).where(User.username == "ipshita"))
-        if not demo_user:
-            demo_user = User(username="ipshita", name="Ipshita Das", email="ipshita@gmail.com", department="Engineering", password_hash=password_digest("1234"))
-            db.add(demo_user)
-        else:
-            demo_user.name = "Ipshita Das"
-            demo_user.email = "ipshita@gmail.com"
-            demo_user.department = "Engineering"
-            demo_user.password_hash = password_digest("1234")
-
     seed_locations(db)
-    db.flush()
-    if not args.locations_only:
-        user = db.scalar(select(User).where(User.username == "ipshita"))
-        first_workspace = db.scalar(select(Workspace).order_by(Workspace.id))
-        if user and not db.scalar(select(Preference).where(Preference.user_id == user.id)):
-            db.add(Preference(user_id=user.id, preferred_type="desk", preferred_location="Bengaluru", preferred_facilities="monitor,power", quiet_preference=True))
-        if user and first_workspace and not db.scalar(select(Booking).where(Booking.user_id == user.id)):
-            db.add(Booking(user_id=user.id, workspace_id=first_workspace.id, booking_date=date.today() + timedelta(days=1), start_time=time(9, 0), end_time=time(17, 0), status="confirmed"))
+    admin = db.scalar(select(User).where(User.username == "admin"))
+    if not admin:
+        db.add(User(
+            username="admin",
+            name="FLEXDESK Administrator",
+            email=None,
+            department="Administration",
+            password_hash=hash_password("Flexdesk@123"),
+            role="admin",
+        ))
     db.commit()
 
-scope = "locations" if args.locations_only else "full"
-print(f"FLEXDESK {scope} seed complete: {len(OFFICES)} screenshot locations updated")
+print(f"FLEXDESK location seed complete: {len(OFFICES)} screenshot locations updated")

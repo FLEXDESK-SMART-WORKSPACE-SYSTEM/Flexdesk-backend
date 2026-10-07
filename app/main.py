@@ -16,8 +16,9 @@ from starlette.middleware.sessions import SessionMiddleware
 
 from .db import Base, engine, ensure_schema, get_db
 from .location_catalog import LOCATION_NAMES, OFFICES
-from .models import Bay, Booking, Floor, Location, Preference, User, Workspace
-from .schemas import AssistantRequest, BookingCreate, BookingOut, FloorOut, LocationOut, LoginRequest, LoginResponse, PreferenceIn, PreferenceOut, RecommendationRequest, UserOut, WorkspaceOut, WorkspaceSearch
+from .models import Bay, Booking, Floor, Location, LoginHistory, Preference, User, Workspace
+from .schemas import AssistantRequest, BookingCreate, BookingOut, FloorOut, LocationOut, LoginRequest, LoginResponse, PasswordCreateRequest, PasswordResetRequest, PreferenceIn, PreferenceOut, RecommendationRequest, UserOut, WorkspaceOut, WorkspaceSearch
+from .security import hash_password, verify_password
 from .services import available_workspaces, parse_assistant_query, score_workspace
 
 Base.metadata.create_all(bind=engine)
@@ -25,6 +26,9 @@ ensure_schema()
 app = FastAPI(title="FLEXDESK Backend", version="1.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173", "http://localhost:5174"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 logger = logging.getLogger(__name__)
+token_secret = os.getenv("AUTH_TOKEN_SECRET") or secrets.token_urlsafe(48)
+if not os.getenv("AUTH_TOKEN_SECRET"):
+    logger.warning("AUTH_TOKEN_SECRET is unset; access tokens will expire when this backend process restarts")
 frontend_url = os.getenv("FRONTEND_URL", "http://localhost:5174").rstrip("/")
 tenant_id = os.getenv("MICROSOFT_TENANT_ID", "").strip()
 session_secret = os.getenv("SSO_SESSION_SECRET", "")
@@ -49,17 +53,8 @@ if session_secret:
     )
 
 
-def demo_auth_enabled() -> bool:
-    return os.getenv("ALLOW_DEMO_AUTH", "false").lower() == "true"
-
-
 def access_token(user: User) -> str:
-    secret = os.getenv("AUTH_TOKEN_SECRET")
-    if not secret:
-        if demo_auth_enabled():
-            return str(user.id)
-        raise HTTPException(status_code=503, detail="AUTH_TOKEN_SECRET is not configured")
-    return URLSafeTimedSerializer(secret, salt="flexdesk-access").dumps({"sub": user.id})
+    return URLSafeTimedSerializer(token_secret, salt="flexdesk-access").dumps({"sub": user.id})
 
 
 def sso_redirect(fragment: str) -> RedirectResponse:
@@ -80,54 +75,211 @@ def sso_configured() -> bool:
 
 def current_user(authorization: str | None = Header(default=None), db: Session = Depends(get_db)) -> User:
     token = authorization.removeprefix("Bearer ").strip() if authorization else ""
-    if token.isdigit() and demo_auth_enabled():
-        user = db.get(User, int(token))
-    else:
+    user = None
+    try:
+        claims = URLSafeTimedSerializer(token_secret, salt="flexdesk-access").loads(token, max_age=43200)
+        user = db.get(User, int(claims["sub"]))
+    except (BadData, KeyError, TypeError, ValueError):
         user = None
-        secret = os.getenv("AUTH_TOKEN_SECRET")
-        if secret:
-            try:
-                claims = URLSafeTimedSerializer(secret, salt="flexdesk-access").loads(token, max_age=43200)
-                user = db.get(User, int(claims["sub"]))
-            except (BadData, KeyError, TypeError, ValueError):
-                user = None
     if not user:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="A valid bearer token is required")
     return user
 
 
-def password_digest(password: str) -> str:
-    return hashlib.pbkdf2_hmac("sha256", password.encode(), b"flexdesk-auth", 120_000).hex()
+def require_admin(user: User = Depends(current_user)) -> User:
+    if user.role != "admin":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Administrator access required.")
+    return user
 
 
 @app.post("/api/v1/auth/login", response_model=LoginResponse)
 def login(payload: LoginRequest, db: Session = Depends(get_db)):
-    email = payload.email.lower().strip()
-    user = db.scalar(select(User).where(User.email == email))
-    if user and user.password_hash and user.password_hash == password_digest(payload.password):
-        return {"access_token": access_token(user), "user": user}
-    if os.getenv("ALLOW_DEMO_AUTH", "false").lower() == "true":
-        if not user:
-            name = email.partition("@")[0].replace(".", " ").replace("_", " ").replace("-", " ").strip().title()[:120] or "Demo User"
-            user = User(
-                username=f"demo_{secrets.token_hex(8)}",
-                name=name,
-                email=email,
-                department="Demo",
-                password_hash=password_digest(payload.password),
-            )
-            db.add(user)
-            try:
-                db.commit()
-            except IntegrityError:
-                db.rollback()
-                user = db.scalar(select(User).where(User.email == email))
-                if not user:
-                    raise
-            else:
-                db.refresh(user)
-        return {"access_token": access_token(user), "user": user}
-    raise HTTPException(status_code=401, detail="Invalid email or password")
+    user = db.scalar(select(User).where(User.username == payload.employee_id.strip()))
+    if not user or not user.password_hash:
+        db.add(LoginHistory(user_id=user.id if user else None, event="failed_login"))
+        db.commit()
+        raise HTTPException(status_code=409, detail={"code": "password_not_created", "message": "Create a password to continue."})
+    if user and user.password_hash and verify_password(payload.password, user.password_hash):
+        token = access_token(user)
+        db.add(LoginHistory(user_id=user.id, event="login"))
+        db.commit()
+        return {"access_token": token, "user": user}
+    db.add(LoginHistory(user_id=user.id if user else None, event="failed_login"))
+    db.commit()
+    raise HTTPException(status_code=401, detail="Invalid employee ID or password.")
+
+
+@app.get("/api/v1/admin/employees")
+def admin_employees(employee_id: str | None = None, _: User = Depends(require_admin), db: Session = Depends(get_db)):
+    query = select(User)
+    if employee_id:
+        query = query.where(User.username == employee_id)
+    users = db.scalars(query.order_by(User.username)).all()
+    return [{
+        "employee_id": user.username,
+        "name": user.name,
+        "email": user.email,
+        "department": user.department,
+        "role": user.role,
+        "created_at": user.created_at,
+    } for user in users]
+
+
+@app.get("/api/v1/admin/bookings")
+def admin_bookings(
+    employee_id: str | None = None,
+    location: str | None = None,
+    floor: str | None = None,
+    booking_date: date | None = None,
+    status_filter: str | None = Query(default=None, alias="status"),
+    _: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    query = (
+        select(Booking, User, Workspace, Bay, Floor, Location)
+        .join(User, Booking.user_id == User.id)
+        .join(Workspace, Booking.workspace_id == Workspace.id)
+        .join(Bay, Workspace.bay_id == Bay.id)
+        .join(Floor, Bay.floor_id == Floor.id)
+        .join(Location, Floor.location_id == Location.id)
+    )
+    if employee_id:
+        query = query.where(User.username == employee_id)
+    if location:
+        query = query.where(Location.name == location)
+    if floor:
+        query = query.where(Floor.name == floor)
+    if booking_date:
+        query = query.where(Booking.booking_date == booking_date)
+    if status_filter:
+        query = query.where(Booking.status == status_filter)
+    rows = db.execute(query.order_by(Booking.booking_date.desc(), Booking.start_time)).all()
+    return [{
+        "employee_id": user.username,
+        "location": loc.name,
+        "floor": flr.name,
+        "bay": bay.name,
+        "booking_type": workspace.workspace_type,
+        "workspace": workspace.name,
+        "date": booking.booking_date,
+        "from": booking.start_time,
+        "to": booking.end_time,
+        "lunch": None,
+        "snacks": None,
+        "status": booking.status,
+    } for booking, user, workspace, bay, flr, loc in rows]
+
+
+@app.get("/api/v1/admin/login-history")
+def admin_login_history(
+    employee_id: str | None = None,
+    event: str | None = None,
+    event_date: date | None = None,
+    _: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    query = select(LoginHistory, User).outerjoin(User, LoginHistory.user_id == User.id)
+    if employee_id:
+        query = query.where(User.username == employee_id)
+    if event:
+        query = query.where(LoginHistory.event == event)
+    if event_date:
+        query = query.where(func.date(LoginHistory.created_at) == event_date)
+    rows = db.execute(query.order_by(LoginHistory.created_at.desc())).all()
+    return [{
+        "employee_id": user.username if user else None,
+        "event": history.event,
+        "created_at": history.created_at,
+    } for history, user in rows]
+
+
+@app.get("/api/v1/admin/workspaces")
+def admin_workspaces(
+    location: str | None = None,
+    floor: str | None = None,
+    _: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    query = (
+        select(Location, Floor, Bay, Workspace)
+        .outerjoin(Floor, Floor.location_id == Location.id)
+        .outerjoin(Bay, Bay.floor_id == Floor.id)
+        .outerjoin(Workspace, Workspace.bay_id == Bay.id)
+    )
+    if location:
+        query = query.where(Location.name == location)
+    if floor:
+        query = query.where(Floor.name == floor)
+    rows = db.execute(query.order_by(Location.name, Floor.floor_number, Bay.name, Workspace.name)).all()
+    return [{
+        "location": loc.name,
+        "floor": flr.name if flr else None,
+        "bay": bay.name if bay else None,
+        "bay_type": bay.bay_type if bay else None,
+        "workspace": workspace.name if workspace else None,
+        "workspace_type": workspace.workspace_type if workspace else None,
+        "capacity": workspace.capacity if workspace else None,
+        "status": workspace.status if workspace else None,
+    } for loc, flr, bay, workspace in rows]
+
+
+@app.post("/api/v1/auth/password")
+def create_password(payload: PasswordCreateRequest, db: Session = Depends(get_db)):
+    employee_id = payload.employee_id.strip()
+    user = db.scalar(select(User).where(User.username == employee_id).with_for_update())
+    if user:
+        if user.password_hash and verify_password(payload.password, user.password_hash):
+            db.add(LoginHistory(user_id=user.id, event="login"))
+            db.commit()
+            return {"access_token": access_token(user), "user": user}
+        if user.password_hash:
+            db.add(LoginHistory(user_id=user.id, event="failed_login"))
+            db.commit()
+            raise HTTPException(status_code=401, detail="Invalid employee ID or password.")
+        user.password_hash = hash_password(payload.password)
+    else:
+        user = User(
+            username=employee_id,
+            name=employee_id,
+            email=None,
+            password_hash=hash_password(payload.password),
+        )
+        db.add(user)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        user = db.scalar(select(User).where(User.username == employee_id))
+        if user and user.password_hash and verify_password(payload.password, user.password_hash):
+            db.add(LoginHistory(user_id=user.id, event="login"))
+            db.commit()
+            return {"access_token": access_token(user), "user": user}
+        db.add(LoginHistory(user_id=user.id if user else None, event="failed_login"))
+        db.commit()
+        raise HTTPException(status_code=401, detail="Invalid employee ID or password.")
+    return {"message": "Password created. Please sign in."}
+
+
+@app.post("/api/v1/auth/password/reset")
+def reset_password(payload: PasswordResetRequest, db: Session = Depends(get_db)):
+    user = db.scalar(select(User).where(User.username == payload.employee_id.strip()).with_for_update())
+    if not user:
+        db.add(LoginHistory(event="failed_login"))
+        db.commit()
+        raise HTTPException(status_code=404, detail="Employee ID not found.")
+    if not payload.password:
+        return {"exists": True}
+    user.password_hash = hash_password(payload.password)
+    db.add(LoginHistory(user_id=user.id, event="password_reset"))
+    db.commit()
+    return {"message": "Password updated. Please sign in."}
+
+
+@app.post("/api/v1/auth/logout")
+def logout(user: User = Depends(current_user), db: Session = Depends(get_db)):
+    db.add(LoginHistory(user_id=user.id, event="logout"))
+    db.commit()
+    return {"message": "Logged out"}
 
 
 @app.get("/api/v1/auth/me", response_model=UserOut)
@@ -153,6 +305,8 @@ async def microsoft_sso_callback(request: Request, db: Session = Depends(get_db)
         subject = str(claims.get("oid") or claims.get("sub") or "")
         email = str(claims.get("email") or claims.get("preferred_username") or claims.get("upn") or "").strip().lower()
         if claimed_tenant != tenant_id.lower() or not subject or "@" not in email or len(email) > 255:
+            db.add(LoginHistory(event="failed_login"))
+            db.commit()
             return sso_redirect("sso_error=identity_not_allowed")
 
         entra_subject = f"{claimed_tenant}:{subject}"
@@ -160,6 +314,8 @@ async def microsoft_sso_callback(request: Request, db: Session = Depends(get_db)
         if not user:
             user = db.scalar(select(User).where(func.lower(User.email) == email))
             if user and user.entra_subject and user.entra_subject != entra_subject:
+                db.add(LoginHistory(user_id=user.id, event="failed_login"))
+                db.commit()
                 return sso_redirect("sso_error=account_conflict")
             if not user:
                 identity_key = hashlib.sha256(entra_subject.encode()).hexdigest()
@@ -173,8 +329,8 @@ async def microsoft_sso_callback(request: Request, db: Session = Depends(get_db)
                 db.add(user)
             else:
                 user.entra_subject = entra_subject
-        if claims.get("name"):
-            user.name = str(claims["name"])[:120]
+            if claims.get("name"):
+                user.name = str(claims["name"])[:120]
         try:
             db.commit()
         except IntegrityError:
@@ -184,10 +340,14 @@ async def microsoft_sso_callback(request: Request, db: Session = Depends(get_db)
                 raise
         else:
             db.refresh(user)
+        db.add(LoginHistory(user_id=user.id, event="login"))
+        db.commit()
         return sso_redirect(f"access_token={access_token(user)}")
     except Exception:
         db.rollback()
         logger.exception("Microsoft Entra sign-in failed")
+        db.add(LoginHistory(event="failed_login"))
+        db.commit()
         return sso_redirect("sso_error=authentication_failed")
 
 

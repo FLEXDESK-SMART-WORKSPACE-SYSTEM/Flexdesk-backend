@@ -1,6 +1,14 @@
 from datetime import date, datetime, time
 
-from pydantic import BaseModel, ConfigDict, Field
+import re
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+
+def validate_password_strength(password: str) -> str:
+    if not re.fullmatch(r"(?=.*[A-Z])(?=.*[a-z])(?=.*[0-9])(?=.*[^A-Za-z0-9]).{8,256}", password):
+        raise ValueError("Password must be at least 8 characters and include uppercase, lowercase, number and special character.")
+    return password
 
 
 class ORMModel(BaseModel):
@@ -11,13 +19,28 @@ class UserOut(ORMModel):
     id: int
     username: str
     name: str
-    email: str
+    email: str | None = None
     department: str | None = None
+    role: str = "employee"
 
 
 class LoginRequest(BaseModel):
-    email: str
-    password: str
+    employee_id: str = Field(pattern=r"^(?:[0-9]{5}|admin)$")
+    password: str = Field(max_length=256)
+
+
+class PasswordCreateRequest(BaseModel):
+    employee_id: str = Field(pattern=r"^[0-9]{5}$")
+    password: str = Field(min_length=8, max_length=256)
+
+    _validate_password = field_validator("password")(validate_password_strength)
+
+
+class PasswordResetRequest(BaseModel):
+    employee_id: str = Field(pattern=r"^[0-9]{5}$")
+    password: str | None = Field(default=None, min_length=8, max_length=256)
+
+    _validate_password = field_validator("password")(validate_password_strength)
 
 
 class LoginResponse(BaseModel):

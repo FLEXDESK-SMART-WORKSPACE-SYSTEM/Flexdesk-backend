@@ -4,19 +4,26 @@ from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Integer, String, Tim
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .db import Base
-
-
 class User(Base):
     __tablename__ = "users"
     id: Mapped[int] = mapped_column(primary_key=True)
     username: Mapped[str] = mapped_column(String(80), unique=True, index=True, default="")
     name: Mapped[str] = mapped_column(String(120))
-    email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    email: Mapped[str | None] = mapped_column(String(255), nullable=True)
     entra_subject: Mapped[str | None] = mapped_column(String(255), unique=True, index=True)
     department: Mapped[str | None] = mapped_column(String(120))
     password_hash: Mapped[str | None] = mapped_column(String(255))
+    role: Mapped[str] = mapped_column(String(20), default="employee", server_default="employee")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     preferences: Mapped["Preference | None"] = relationship(back_populates="user", uselist=False, cascade="all, delete-orphan")
+
+
+class LoginHistory(Base):
+    __tablename__ = "login_history"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), index=True)
+    event: Mapped[str] = mapped_column(String(20))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
 class Location(Base):
